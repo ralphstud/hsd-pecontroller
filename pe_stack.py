@@ -49,7 +49,6 @@ class PEStack(Elaboratable):
 
         m.submodules.adder_tree = adder_tree = self.adder_tree
 
-        # TODO
         for i in range(self.num_stack):
             m.d.comb += [
                 adder_tree.in_data[i].eq(self.pe_arr[i].out_d),
@@ -67,8 +66,8 @@ class PEStack(Elaboratable):
 
             # TODO
             m.d.comb += [
-                pe.in_a.eq(self.in_a[self.num_bits * i:self.num_bits + self.num_bits * i - 1]),
-                pe.in_b.eq(self.in_b[self.num_bits * i:self.num_bits + self.num_bits * i - 1]),
+                pe.in_a.eq(self.in_a[self.num_bits * (i):self.num_bits * (i+1)]),
+                pe.in_b.eq(self.in_b[self.num_bits * (i):self.num_bits * (i+1)]),
                 pe.in_init.eq(self.in_init),
                 pe.in_rst.eq(self.in_rst)
             ]
