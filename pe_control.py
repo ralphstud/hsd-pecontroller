@@ -1,6 +1,6 @@
 from amaranth import *
 from pe_stack import PEStack
-from enum import IntEnum
+from enum import IntEnum, Enum
 import math
 from amaranth.lib.fifo import SyncFIFOBuffered
 
@@ -67,7 +67,14 @@ from amaranth.lib.fifo import SyncFIFOBuffered
 # EXEC
 # FLUSH
 # STORE
-
+class STATECODE(str, Enum):
+    INIT    = 'INIT'
+    FETCH   = 'FETCH'
+    DECODE  = 'DECODE' # also handle set_m
+    LOAD    = 'LOAD'
+    EXEC    = 'EXEC'
+    FLUSH   = 'FLUSH'
+    STORE   = 'STORE'
 
 # 4-bit OPCode
 class OPCODE(IntEnum):
@@ -147,9 +154,17 @@ class PEControl(Elaboratable):
         self.next_pc_ovf = Signal(1)
 
         self.opcode = Signal(4)
-        self.v1 = Signal(4)
-        self.v2 = Signal(24)
 
+        # split v1 for convinient
+        # (use only when opcode == OPCODE.EXEC)
+        # 1b            1b           2b
+        # v1_fifo_a     v1_fifo_b    v1_act
+        self.v1 = Signal(4)
+        self.v1_fifo_a = Signal(1)
+        self.v1_fifo_b = Signal(1)
+        self.v1_act = Signal(2)
+
+        self.v2 = Signal(24)
         self.v2_f = Signal(self.cnt_bits)
 
         # control fan in
@@ -164,49 +179,104 @@ class PEControl(Elaboratable):
         self.magic_cnt = Signal(32)
         self.magic_cnt_ovf = Signal(1)
         self.magic_init = 0xCAFE0000
+        self.magic_end = 0xCAFECAFE
 
         self.pe_ptr = Signal(width)
 
         # feel free to add any internal Signal you want
 
+        # register for convinient
+        self.cache_mem = Signal(4)
+
     def elaborate(self, platform):
         m = Module()
 
+        # pe / FIFO
         m.submodules.pe = pe = self.pe
         m.submodules.pipe_a = pipe_a = self.lb_a
         m.submodules.pipe_b = pipe_b = self.lb_b
 
         m.d.comb += [
+            # io pipe (FIFO)
             pipe_a.w_data.eq(self.in_r_data),
             pipe_b.w_data.eq(
                 Mux(self.reuse_b, pipe_b.r_data, self.in_r_data)),
+
+            # fan control
+            self.fan_cnt_next.eq(self.fan_cnt + 1),
+
+            # pe interface
             pe.in_rst.eq(self.in_rst),
             pe.in_a.eq(pipe_a.r_data),
             pe.in_b.eq(pipe_b.r_data),
+            self.pe_ptr.eq(self.pe.out_d),
+
+            # gb memory interface
             self.out_r_addr.eq(self.addr_io),
             self.out_w_addr.eq(self.addr_io),
+
+            # opcode interface
             Cat(self.v2, self.v1, self.opcode).eq(self.in_r_data[:32]),
-            self.fan_cnt_next.eq(self.fan_cnt + 1),
-            self.pe_ptr.eq(self.pe.out_d),
             self.v2_f.eq(self.v2[:self.cnt_bits]),
-            # feel free to add any combinatorial logics
+            ### split v1 for convinient
+            ### (use only when opcode == OPCODE.EXEC)
+            Cat(self.v1_act, self.v1_fifo_b, self.v1_fifo_a).eq(self.v1),
+            ### ignore activation code for now
+            ### self.pe.in_act.eq(self.v1_act),
         ]
 
-        with m.FSM(reset='INIT'):
-            with m.State('INIT'):
-                # TODO
-                pass
-            with m.State('FETCH'):
-                # TODO
-                pass
-            with m.State('DECODE'):
+        with m.FSM(reset=STATECODE.INIT):
+            with m.State(STATECODE.INIT):
+                # wait until global buffer address 0 == 0xCAFE0000
+                with m.If(self.in_r_data == self.magic_init):
+                    m.next = STATECODE.FETCH
+                    m.d.sync += [
+                        self.magic_cnt.eq(self.magic_init),
+                        self.magic_cnt_ovf.eq(0)
+                    ]
+
+            with m.State(STATECODE.FETCH):
+                with m.If(self.in_r_data == self.magic_end):
+                    m.next = STATECODE.INIT
+                # transite to decode when ready
+                with m.Elif(self.addr_io == self.next_pc):
+                    m.next = STATECODE.DECODE
+                    m.d.sync += [
+                        Cat(self.next_pc, self.next_pc_ovf).eq(self.next_pc+1)
+                    ]
+
+                # set pc
+                with m.Else():
+                    m.d.sync += [
+                        self.addr_io.eq(self.next_pc),
+                        self.addr_io_ovf.eq(self.next_pc_ovf),
+                    ]
+
+            with m.State(STATECODE.DECODE):
                 with m.Switch(self.opcode):
                     with m.Case(OPCODE.LOAD):
                         # OP     V1               V2
                         # 4b     4b               24b
                         # load   to[a|b]          from(gb_addr)
-                        m.next = 'LOAD'
-                        # TODO
+                        m.next = STATECODE.LOAD
+
+                        # convert r_mode -> w_mode
+                        with m.If(self.v1 == LOAD_DEST.A):
+                            m.d.sync += [
+                                pipe_a.w_rdy.eq(1),
+                            ]
+                        with m.Else():
+                            m.d.sync += [
+                                pipe_b.w_rdy.eq(1),
+                            ]
+
+                        # set addr / cache
+                        m.d.sync += [
+                            Cat(self.addr_io, self.addr_io_ovf).eq(self.v2),
+                            self.fan_cnt.eq(0),
+                            self.cache_mem.eq(self.v1),
+                        ]
+
                     with m.Case(OPCODE.EXEC):
                         # OP     V1               V2
                         # 4b     4b               24b
@@ -223,17 +293,45 @@ class PEControl(Elaboratable):
                         # 0 for None
                         # 1 for ReLU
 
-                        m.next = 'EXEC'
-                        # TODO
+                        m.next = STATECODE.EXEC
+
+                        # ignore activation for now
+                        # ignore reuse_a for now
+
+                        # ensure fifo is readable
+                        with m.Switch(self.v1_fifo_b):
+                            with m.Case(FIFO.REUSE):
+                                m.d.sync += [
+                                    self.reuse_b.eq(1),
+                                    pipe_a.r_en.eq(1),
+                                    pipe_b.r_en.eq(0),
+                                ]
+                            with m.Case(FIFO.FLOW):
+                                m.d.sync += [
+                                    self.reuse_b.eq(0),
+                                    pipe_a.r_en.eq(1),
+                                    pipe_b.r_en.eq(1),
+                                ]
+                        m.d.sync += [
+                            self.pe.in_init.eq(self.fan_in),
+                            self.fan_cnt.eq(0),
+                            pipe_a.w_en.eq(0),
+                            pipe_b.w_en.eq(0),
+                        ]
                     with m.Case(OPCODE.STORE):
                         # OP     V1               V2
                         # 4b     4b               24b
                         # store                   to(gb_addr)
-                        m.next = 'STORE'
-                        # TODO
+                        m.next = STATECODE.STORE
+                        m.d.sync += [
+                            Cat(self.addr_io, self.addr_io_ovf).eq(self.v2),
+                            self.out_w_en.eq(1),
+                            self.out_w_data.eq(self.pe_ptr),
+                            Cat(self.magic_cnt, self.magic_cnt_ovf).eq(self.magic_cnt+1),
+                        ]
 
                     with m.Case(OPCODE.FLUSH):
-                        m.next = 'FLUSH'
+                        m.next = STATECODE.FLUSH
                         m.d.sync += [
                             pipe_b.r_en.eq(1),
                         ]
@@ -242,23 +340,57 @@ class PEControl(Elaboratable):
                         # OP     V1               V2
                         # 4b     4b               24b
                         # set_m                   fan_in
-                        m.next = 'FETCH'
-                        # TODO
-                    with m.Case():  # default
-                        m.next = 'INIT'
+                        m.next = STATECODE.FETCH
 
-            with m.State('LOAD'):
-                # TODO
+                        m.d.sync += [
+                            self.fan_in.eq(self.v2)
+                        ]
+                    with m.Case():  # default
+                        m.next = STATECODE.INIT
+
+            with m.State(STATECODE.LOAD):
+                # Load global buffer -> FIFO
+                with m.If(self.fan_cnt < self.fan_in):
+                    m.d.sync += [
+                        self.fan_cnt.eq(self.fan_cnt_next),
+                    ]
+                    with m.If(self.cache_mem == LOAD_DEST.A):
+                        m.d.sync += [
+                            pipe_a.w_en.eq(1),
+                        ]
+                    with m.Else():
+                        m.d.sync += [
+                            pipe_b.w_en.eq(1),
+                        ]
+                with m.Else():
+                    m.d.sync += [
+                        pipe_a.w_en.eq(0),
+                        pipe_b.w_en.eq(0),
+                    ]
+                    m.next = STATECODE.FETCH
+            with m.State(STATECODE.EXEC):
+                with m.If(self.fan_cnt_next < self.fan_in):
+                    m.d.sync += [
+                        self.pe.in_init.eq(0),
+                        self.fan_cnt.eq(self.fan_cnt_next),
+                    ]
+                with m.Else():
+                    m.d.sync += [
+                        self.pe.in_init.eq(0),
+                        pipe_a.r_en.eq(0),
+                        pipe_b.r_en.eq(0),
+                    ]
+                    m.next = STATECODE.FETCH
                 pass
-            with m.State('EXEC'):
-                # TODO
-                pass
-            with m.State('STORE'):
-                # TODO
-                m.next = 'FETCH'
-            with m.State('FLUSH'):
+            with m.State(STATECODE.STORE):
+                m.d.sync += [
+                    self.out_w_en.eq(0),
+                    self.out_w_data.eq(self.magic_cnt),
+                ]
+                m.next = STATECODE.FETCH
+            with m.State(STATECODE.FLUSH):
                 with m.If(~pipe_b.r_rdy):
-                    m.next = 'FETCH'
+                    m.next = STATECODE.FETCH
                     m.d.sync += [
                         pipe_b.r_en.eq(0),
                     ]

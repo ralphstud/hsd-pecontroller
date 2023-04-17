@@ -49,27 +49,26 @@ class PEStack(Elaboratable):
 
         m.submodules.adder_tree = adder_tree = self.adder_tree
 
-        for i in range(self.num_stack):
-            m.d.comb += [
-                adder_tree.in_data[i].eq(self.pe_arr[i].out_d),
-                adder_tree.in_valid[i].eq(self.pe_arr[i].out_d_valid),
-                adder_tree.in_ovf[i].eq(self.pe_arr[i].out_ovf)
-            ]
         m.d.comb += [
             self.out_d.eq(adder_tree.out_d),
             self.out_ready.eq(adder_tree.out_valid),
             self.out_ovf.eq(adder_tree.out_ovf)
         ]
 
-        for i, pe in enumerate(self.pe_arr):
-            m.submodules += pe
+        for i in range(self.num_stack):
+            m.submodules += self.pe_arr[i]
 
-            # TODO
             m.d.comb += [
-                pe.in_a.eq(self.in_a[self.num_bits * (i):self.num_bits * (i+1)]),
-                pe.in_b.eq(self.in_b[self.num_bits * (i):self.num_bits * (i+1)]),
-                pe.in_init.eq(self.in_init),
-                pe.in_rst.eq(self.in_rst)
+                adder_tree.in_data[i].eq(self.pe_arr[i].out_d),
+                adder_tree.in_valid[i].eq(self.pe_arr[i].out_d_valid),
+                adder_tree.in_ovf[i].eq(self.pe_arr[i].out_ovf)
+            ]
+
+            m.d.comb += [
+                self.pe_arr[i].in_a.eq(self.in_a[self.num_bits * (i):self.num_bits * (i+1)]),
+                self.pe_arr[i].in_b.eq(self.in_b[self.num_bits * (i):self.num_bits * (i+1)]),
+                self.pe_arr[i].in_init.eq(self.in_init),
+                self.pe_arr[i].in_rst.eq(self.in_rst)
             ]
 
         return m
