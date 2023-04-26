@@ -236,8 +236,6 @@ class PEControl(Elaboratable):
                     ]
 
             with m.State(STATECODE.FETCH):
-                with m.If(self.in_r_data == self.magic_end):
-                    m.next = STATECODE.INIT
                 # transite to decode when ready
                 with m.Elif(self.addr_io == self.next_pc):
                     m.next = STATECODE.DECODE
@@ -253,6 +251,14 @@ class PEControl(Elaboratable):
                     ]
 
             with m.State(STATECODE.DECODE):
+                # when in_r_data == magic_end == 0xCAFE_CAFE
+                # state change from DECODE to INIT
+                with m.If(self.in_r_data == self.magic_end):
+                    m.next = STATECODE.INIT
+
+                    # halt by returning m
+                    return m
+
                 with m.Switch(self.opcode):
                     with m.Case(OPCODE.LOAD):
                         # OP     V1               V2
